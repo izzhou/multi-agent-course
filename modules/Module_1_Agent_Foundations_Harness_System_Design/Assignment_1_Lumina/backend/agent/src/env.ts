@@ -33,6 +33,9 @@ export const env = {
   pageMaxChars: num(process.env.PAGE_MAX_CHARS, 6000),
 
   embeddingModel: process.env.EMBEDDING_MODEL ?? 'text-embedding-3-small',
+  embeddingUsdPerMtok: num(process.env.EMBEDDING_USD_PER_MTOK, 0.02),
+  /** Long-term memories injected into one answer, at most. */
+  memoryRecallLimit: num(process.env.MEMORY_RECALL_LIMIT, 10),
 
   // Deep search is the expensive gear, so its limits are configuration, not code.
   deepSubQuestionsMin: num(process.env.DEEP_SUB_QUESTIONS_MIN, 3),

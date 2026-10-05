@@ -16,6 +16,7 @@ import {
   USER_HEADER,
   newId,
   type GetThreadResponse,
+  type ListMemoryResponse,
   type ListThreadsResponse,
   type MessageDoc,
   type RunDoc,
@@ -25,8 +26,9 @@ import {
 import { env } from './env.js';
 import { db } from './db.js';
 import { sseHeaders, sseSend } from './sse.js';
-import { newRunState, runQuick } from './loop.js';
-import { ProviderError, llmCostUsd } from './llm.js';
+import { newRunState, runCostUsd, runQuick } from './loop.js';
+import { ProviderError } from './llm.js';
+import { deleteMemory, listMemories } from './memory.js';
 
 const HISTORY_MESSAGES = 6;
 
@@ -123,6 +125,27 @@ export function registerRoutes(app: express.Express, log: Logger): void {
     }
   });
 
+  // ---------------------------------------------------------------- memory
+
+  app.get('/memory', async (_req, res, next) => {
+    try {
+      const body: ListMemoryResponse = { memories: await listMemories(res.locals.userId) };
+      res.json(body);
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.delete('/memory/:memoryId', async (req, res, next) => {
+    try {
+      const gone = await deleteMemory(res.locals.userId, req.params.memoryId);
+      if (!gone) return fail(res, 404, `no memory ${req.params.memoryId}`);
+      res.status(204).end();
+    } catch (err) {
+      next(err);
+    }
+  });
+
   // ---------------------------------------------------------------- ask
 
   app.post('/threads/:threadId/ask', async (req, res) => {
@@ -165,7 +188,7 @@ export function registerRoutes(app: express.Express, log: Logger): void {
         .reverse()
         .map((m) => ({ role: m.role, content: m.content }));
 
-      const result = await runQuick({ query: ask.query, history, emit, state });
+      const result = await runQuick({ userId, threadId: thread._id, query: ask.query, history, emit, state });
 
       const now = Date.now();
       await messages.insertMany([
@@ -222,7 +245,7 @@ export function registerRoutes(app: express.Express, log: Logger): void {
       const runLog: RunLog = {
         tokens: state.usage.in + state.usage.out,
         wallClockSec: Number(((Date.now() - state.started) / 1000).toFixed(3)),
-        costUsd: Number(llmCostUsd(state.usage).toFixed(6)),
+        costUsd: Number(runCostUsd(state, 0).toFixed(6)),
         terminated: 'error',
         depth: ask.depth,
         toolCalls: state.toolCalls

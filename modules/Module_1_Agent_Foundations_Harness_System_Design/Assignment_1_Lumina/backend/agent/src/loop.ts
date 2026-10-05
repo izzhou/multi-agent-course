@@ -28,6 +28,8 @@ import { env } from './env.js';
 import { anthropic, addUsage, baseParams, llmCostUsd, ProviderError, type Usage } from './llm.js';
 import { webSearch } from './search.js';
 import { bestPassage, fetchPage, prefetch } from './fetchPage.js';
+import { embeddingCostUsd } from './embeddings.js';
+import { recallMemories, saveMemory } from './memory.js';
 
 export type Emit = (event: 'trace' | 'sources' | 'token', data: unknown) => void;
 
@@ -36,11 +38,22 @@ export interface RunState {
   started: number;
   usage: Usage;
   toolCalls: RunLog['toolCalls'];
+  embedTokens: number;
 }
 
-export const newRunState = (): RunState => ({ started: Date.now(), usage: { in: 0, out: 0 }, toolCalls: [] });
+export const newRunState = (): RunState => ({
+  started: Date.now(),
+  usage: { in: 0, out: 0 },
+  toolCalls: [],
+  embedTokens: 0
+});
+
+export const runCostUsd = (s: RunState, uncachedSearches: number) =>
+  llmCostUsd(s.usage) + embeddingCostUsd(s.embedTokens) + uncachedSearches * env.searchUsdPerCall;
 
 export interface AskInput {
+  userId: string;
+  threadId: string;
   query: string;
   history: { role: 'user' | 'assistant'; content: string }[];
   emit: Emit;
@@ -90,8 +103,26 @@ const TOOLS: Anthropic.Tool[] = [
       },
       required: ['url', 'reason']
     }
+  },
+  {
+    name: 'save_memory',
+    description:
+      'Save one durable fact or preference about the user, for all future conversations. Only for things the user states about themselves or explicitly asks you to remember, never for facts learned from a search.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        text: {
+          type: 'string',
+          description: 'The fact or preference as one self-contained sentence, e.g. "Prefers TypeScript code examples over prose."'
+        },
+        reason: { type: 'string', description: 'One short line: why this is worth remembering.' }
+      },
+      required: ['text', 'reason']
+    }
   }
 ];
+
+const SaveInput = z.object({ text: z.string().min(3).max(500), reason: z.string().optional() });
 
 const SearchInput = z.object({ query: z.string().min(1), reason: z.string().optional() });
 const FetchInput = z.object({ url: z.string().url(), reason: z.string().optional() });
@@ -100,13 +131,15 @@ const RESEARCH_SYSTEM = `You research questions for a search engine that answers
 Use web_search, then fetch_page on the 2 to 4 most promising results. Call several tools in one turn when they are independent.
 Prefer primary and authoritative sources. Do not fetch a page you already fetched.
 When the fetched pages are enough to answer, stop calling tools and reply with the single word READY. Do not write the answer yourself.
-Keep it cheap: most questions need one search and two or three pages.`;
+Keep it cheap: most questions need one search and two or three pages.
+If the user states a lasting preference or fact about themselves, or asks you to remember something, call save_memory once with it. If the message is only that request, you do not need to search.`;
 
 const ANSWER_SYSTEM = `You write the answer for a search engine, using ONLY the numbered sources provided.
 Rules:
 - Put a citation like [1] or [2][3] right after every claim that a source supports. Use only the source numbers given.
 - Never invent facts, URLs or source numbers. If the sources do not answer the question, say so plainly and cite nothing.
-- Lead with the direct answer. Be concise: a short paragraph or a few bullets, no preamble.`;
+- Lead with the direct answer. Be concise: a short paragraph or a few bullets, no preamble.
+- Follow the user's saved preferences when they are given. They change how you answer, never what the sources say.`;
 
 const describeError = (err: unknown) => (err instanceof Error ? err.message : String(err)) || 'unknown error';
 
@@ -147,6 +180,7 @@ export class CitationFilter {
 
 export async function runQuick(input: AskInput): Promise<AskOutput> {
   const { started, usage, toolCalls } = input.state;
+  const state = input.state;
   const caps = { toolCalls: env.maxToolCalls, deadline: started + env.maxWallClockSec * 1000 };
   const fetched: Fetched[] = [];
   const searches = { total: 0, cached: 0, failed: 0, errors: [] as string[] };
@@ -161,14 +195,14 @@ export async function runQuick(input: AskInput): Promise<AskOutput> {
 
   // ------------------------------------------------------------ tools
 
-  async function runTool(use: Anthropic.ToolUseBlock): Promise<Anthropic.ToolResultBlockParam> {
+  /** One step of the loop: a trace event the moment it finishes, and a line in the run log. */
+  const tracer = (tool: string, raw: Record<string, unknown>) => {
     const t0 = Date.now();
     const thisStep = ++step;
-    const raw = (use.input ?? {}) as Record<string, unknown>;
-    const trace = (ok: boolean, error?: string) => {
+    return (ok: boolean, error?: string) => {
       const ev: TraceEvent = {
         step: thisStep,
-        tool: use.name as TraceEvent['tool'],
+        tool: tool as TraceEvent['tool'],
         input: raw,
         ok,
         ms: Date.now() - t0,
@@ -178,6 +212,13 @@ export async function runQuick(input: AskInput): Promise<AskOutput> {
       input.emit('trace', ev);
       toolCalls.push({ name: ev.tool, ok, ms: ev.ms, ...(error ? { error } : {}) });
     };
+  };
+
+  const saved: string[] = [];
+
+  async function runTool(use: Anthropic.ToolUseBlock): Promise<Anthropic.ToolResultBlockParam> {
+    const raw = (use.input ?? {}) as Record<string, unknown>;
+    const trace = tracer(use.name, raw);
 
     try {
       if (use.name === 'web_search') {
@@ -213,6 +254,19 @@ export async function runQuick(input: AskInput): Promise<AskOutput> {
         };
       }
 
+      if (use.name === 'save_memory') {
+        const { text } = SaveInput.parse(raw);
+        const { id, duplicate, embedTokens } = await saveMemory(input.userId, text, input.threadId);
+        state.embedTokens += embedTokens;
+        saved.push(text);
+        trace(true);
+        return {
+          type: 'tool_result',
+          tool_use_id: use.id,
+          content: duplicate ? `Already remembered (${id}).` : `Saved as ${id}. The user can see and delete it in their Memory panel.`
+        };
+      }
+
       throw new Error(`unknown tool ${use.name}`);
     } catch (err) {
       const error = describeError(err);
@@ -221,10 +275,31 @@ export async function runQuick(input: AskInput): Promise<AskOutput> {
     }
   }
 
+  // ------------------------------------------------------------ recall
+
+  // Every answer starts by recalling the user's saved memories: it is one embedding and one
+  // indexed query, and leaving it to the model would make a saved preference apply only
+  // when the model happens to think of looking.
+  let memoryText = '';
+  {
+    const raw = { query: input.query, reason: "recall the user's saved preferences before planning" };
+    const trace = tracer('recall_memory', raw);
+    try {
+      const { memories, embedTokens } = await recallMemories(input.userId, input.query);
+      state.embedTokens += embedTokens;
+      trace(true);
+      if (memories.length) {
+        memoryText = `The user's saved preferences and facts:\n${memories.map((m) => `- ${m.text}`).join('\n')}\n\n`;
+      }
+    } catch (err) {
+      trace(false, describeError(err));
+    }
+  }
+
   // ------------------------------------------------------------ phase 1: research
 
   const messages: Anthropic.MessageParam[] = [
-    { role: 'user', content: `${historyText}Question: ${input.query}` }
+    { role: 'user', content: `${memoryText}${historyText}Question: ${input.query}` }
   ];
 
   for (;;) {
@@ -287,6 +362,9 @@ export async function runQuick(input: AskInput): Promise<AskOutput> {
   const sourceBlock = fetched.length
     ? fetched.map((f) => `[${f.n}] ${f.title} (${f.url})\n${f.text.slice(0, env.pageMaxChars)}`).join('\n\n---\n\n')
     : 'No sources were retrieved.';
+  const savedNote = saved.length
+    ? `\nThis turn you saved to the user's long-term memory: ${saved.map((t) => `"${t}"`).join('; ')}. Confirm that in one sentence.`
+    : '';
   const capNote =
     terminated === 'cap'
       ? '\nResearch was cut short by the time or tool-call cap. Say briefly that the answer may be incomplete.'
@@ -306,11 +384,11 @@ export async function runQuick(input: AskInput): Promise<AskOutput> {
     const stream = anthropic.messages.stream({
       ...baseParams,
       max_tokens: 2048,
-      system: ANSWER_SYSTEM + capNote,
+      system: ANSWER_SYSTEM + savedNote + capNote,
       messages: [
         {
           role: 'user',
-          content: `${historyText}Sources:\n\n${sourceBlock}\n\nQuestion: ${input.query}`
+          content: `${memoryText}${historyText}Sources:\n\n${sourceBlock}\n\nQuestion: ${input.query}`
         }
       ]
     });
@@ -328,7 +406,7 @@ export async function runQuick(input: AskInput): Promise<AskOutput> {
 
   const latencyMs = Date.now() - started;
   const uncachedSearches = searches.total - searches.cached;
-  const costUsd = llmCostUsd(usage) + uncachedSearches * env.searchUsdPerCall;
+  const costUsd = runCostUsd(state, uncachedSearches);
 
   const done: DoneEvent = {
     answerId: newId('ans'),
