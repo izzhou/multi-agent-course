@@ -19,9 +19,18 @@ export const env = {
 
   llmProvider: process.env.LLM_PROVIDER ?? 'anthropic',
   llmModel: process.env.LLM_MODEL ?? 'claude-sonnet-5',
+  /** How hard the model thinks. Search answers are latency bound, so low is the default. */
+  llmEffort: (process.env.LLM_EFFORT ?? 'low') as 'low' | 'medium' | 'high',
+  /** Published per-million-token rates for LLM_MODEL. Set them to your provider's real prices. */
+  llmInputUsdPerMtok: num(process.env.LLM_INPUT_USD_PER_MTOK, 2),
+  llmOutputUsdPerMtok: num(process.env.LLM_OUTPUT_USD_PER_MTOK, 10),
 
   searchProvider: (process.env.SEARCH_PROVIDER ?? 'tavily') as 'tavily' | 'serpapi',
   searchCacheTtlSeconds: num(process.env.SEARCH_CACHE_TTL_SECONDS, 21600),
+  searchUsdPerCall: num(process.env.SEARCH_USD_PER_CALL, 0.008),
+  /** Results per search, and how much fetched page text one source may put in front of the model. */
+  searchMaxResults: num(process.env.SEARCH_MAX_RESULTS, 5),
+  pageMaxChars: num(process.env.PAGE_MAX_CHARS, 6000),
 
   embeddingModel: process.env.EMBEDDING_MODEL ?? 'text-embedding-3-small',
 

@@ -42,6 +42,7 @@ import { mkdirSync } from 'node:fs';
 import { HealthResponse, ROUTES } from '@lumina/contract';
 import { env } from './env.js';
 import { pingDb } from './db.js';
+import { registerRoutes } from './routes.js';
 
 const log = pino({ level: env.logLevel });
 const app = express();
@@ -69,6 +70,10 @@ app.get('/health', async (_req, res) => {
   };
   res.status(dbStatus === 'ok' ? 200 : 503).json(body);
 });
+
+// ---------------------------------------------------------------- built routes
+
+registerRoutes(app, log);
 
 // ---------------------------------------------------------------- everything else: 501
 
