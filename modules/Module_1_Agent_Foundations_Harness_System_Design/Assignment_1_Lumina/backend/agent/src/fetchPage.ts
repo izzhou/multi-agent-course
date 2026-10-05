@@ -81,7 +81,8 @@ const terms = (s: string) =>
  * about 40 to 80 words. Verbatim matters: the snippet is checked against the page itself.
  */
 export function bestPassage(text: string, query: string): string {
-  const sentences = text.match(/[^.!?]+[.!?]+(\s|$)|[^.!?]+$/g)?.map((s) => s.trim()) ?? [text];
+  // Split after . ! ? only when whitespace follows, so "1.2" and "e.g" stay whole.
+  const sentences = text.split(/(?<=[.!?])\s+/).map((s) => s.trim()).filter(Boolean);
   const want = new Set(terms(query));
   let best = '';
   let bestScore = -1;

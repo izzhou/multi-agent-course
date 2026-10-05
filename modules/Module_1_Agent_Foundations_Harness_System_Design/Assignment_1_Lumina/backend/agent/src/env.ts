@@ -37,6 +37,13 @@ export const env = {
   /** Long-term memories injected into one answer, at most. */
   memoryRecallLimit: num(process.env.MEMORY_RECALL_LIMIT, 10),
 
+  // Hybrid retrieval. Declared here, not buried in the query code.
+  docsTopK: num(process.env.DOCS_TOP_K, 5),
+  docsCandidates: num(process.env.DOCS_CANDIDATES, 20),
+  rrfK: num(process.env.RRF_K, 60),
+  /** Run the jobs worker in a worker_thread of this process. Set false to run `npm run worker` on its own. */
+  workerInProcess: process.env.WORKER_IN_PROCESS !== 'false',
+
   // Deep search is the expensive gear, so its limits are configuration, not code.
   deepSubQuestionsMin: num(process.env.DEEP_SUB_QUESTIONS_MIN, 3),
   deepSubQuestionsMax: num(process.env.DEEP_SUB_QUESTIONS_MAX, 6),

@@ -18,7 +18,9 @@ import { z } from 'zod';
 import {
   newId,
   unresolvedCitations,
+  type AskMode,
   type DoneEvent,
+  type Locator,
   type RunLog,
   type Source,
   type Terminated,
@@ -30,6 +32,7 @@ import { webSearch } from './search.js';
 import { bestPassage, fetchPage, prefetch } from './fetchPage.js';
 import { embeddingCostUsd } from './embeddings.js';
 import { recallMemories, saveMemory } from './memory.js';
+import { searchDocuments, spaceHasIndexedDocs } from './rag.js';
 
 export type Emit = (event: 'trace' | 'sources' | 'token', data: unknown) => void;
 
@@ -55,6 +58,8 @@ export interface AskInput {
   userId: string;
   threadId: string;
   query: string;
+  mode: AskMode;
+  spaceId?: string;
   history: { role: 'user' | 'assistant'; content: string }[];
   emit: Emit;
   state: RunState;
@@ -67,13 +72,22 @@ export interface AskOutput {
   runLog: RunLog;
 }
 
-/** A page that was fetched in this request: the only thing an [n] may point at. */
-interface Fetched {
+/** Something retrieved in this request: a fetched page or a document chunk. The only things an [n] may point at. */
+interface Citable {
   n: number;
+  kind: 'web' | 'doc';
   title: string;
-  url: string;
+  url?: string;
+  docId?: string;
+  locator?: Locator;
+  /** Full text the answer is written from. */
   text: string;
+  /** For a doc, the top-ranked chunk's own text, verbatim. Web snippets are picked at the end. */
+  snippet?: string;
 }
+
+const locatorLabel = (l?: Locator) =>
+  l?.page ? `p. ${l.page}` : l?.heading ? `"${l.heading}"` : l?.line ? `line ${l.line}` : '';
 
 const RESEARCH_EXCERPT_CHARS = 2500;
 
@@ -122,13 +136,28 @@ const TOOLS: Anthropic.Tool[] = [
   }
 ];
 
+const DOCS_TOOL: Anthropic.Tool = {
+  name: 'search_documents',
+  description:
+    "Search the user's uploaded documents in this Space (hybrid keyword and semantic search). Returns numbered passages with their page or section.",
+  input_schema: {
+    type: 'object',
+    properties: {
+      query: { type: 'string', description: 'What to look for in the documents.' },
+      reason: { type: 'string', description: 'One short line: why search the documents.' }
+    },
+    required: ['query', 'reason']
+  }
+};
+
 const SaveInput = z.object({ text: z.string().min(3).max(500), reason: z.string().optional() });
 
 const SearchInput = z.object({ query: z.string().min(1), reason: z.string().optional() });
 const FetchInput = z.object({ url: z.string().url(), reason: z.string().optional() });
 
 const RESEARCH_SYSTEM = `You research questions for a search engine that answers with citations.
-Use web_search, then fetch_page on the 2 to 4 most promising results. Call several tools in one turn when they are independent.
+When a search_documents tool is available, the user's own documents come first: if passages already shown answer the question, you are done. Use the web only for what the documents do not cover.
+Otherwise use web_search, then fetch_page on the 2 to 4 most promising results. Call several tools in one turn when they are independent.
 Prefer primary and authoritative sources. Do not fetch a page you already fetched.
 When the fetched pages are enough to answer, stop calling tools and reply with the single word READY. Do not write the answer yourself.
 Keep it cheap: most questions need one search and two or three pages.
@@ -182,7 +211,11 @@ export async function runQuick(input: AskInput): Promise<AskOutput> {
   const { started, usage, toolCalls } = input.state;
   const state = input.state;
   const caps = { toolCalls: env.maxToolCalls, deadline: started + env.maxWallClockSec * 1000 };
-  const fetched: Fetched[] = [];
+  const fetched: Citable[] = [];
+  const docSearches = { total: 0, failed: 0, errors: [] as string[] };
+  const useDocs = !!input.spaceId && input.mode !== 'web';
+  const useWeb = input.mode !== 'docs';
+  const tools = [...(useWeb ? TOOLS.slice(0, 2) : []), ...(useDocs ? [DOCS_TOOL] : []), TOOLS[2]!];
   const searches = { total: 0, cached: 0, failed: 0, errors: [] as string[] };
   let step = 0;
   let terminated: Terminated = 'done';
@@ -216,6 +249,33 @@ export async function runQuick(input: AskInput): Promise<AskOutput> {
 
   const saved: string[] = [];
 
+  /** Runs a document search, registers each hit as a citable source, and returns the text the model sees. */
+  async function docSearch(query: string): Promise<string> {
+    docSearches.total++;
+    try {
+      const { hits, embedTokens } = await searchDocuments(input.userId, input.spaceId!, query);
+      state.embedTokens += embedTokens;
+      if (!hits.length) return 'No matching passages in this Space.';
+      const shown: string[] = [];
+      for (const h of hits) {
+        // One source per document and locator: two chunks of the same page are one citation.
+        let src = fetched.find((f) => f.kind === 'doc' && f.docId === h.docId && locatorLabel(f.locator) === locatorLabel(h.locator));
+        if (!src) {
+          src = { n: fetched.length + 1, kind: 'doc', title: h.title, docId: h.docId, locator: h.locator, text: h.text, snippet: h.text };
+          fetched.push(src);
+        } else if (!src.text.includes(h.text)) {
+          src.text += `\n${h.text}`;
+        }
+        shown.push(`Source [${src.n}]: ${h.title}, ${locatorLabel(h.locator)}\n${h.text}`);
+      }
+      return shown.join('\n\n');
+    } catch (err) {
+      docSearches.failed++;
+      docSearches.errors.push(describeError(err));
+      throw err;
+    }
+  }
+
   async function runTool(use: Anthropic.ToolUseBlock): Promise<Anthropic.ToolResultBlockParam> {
     const raw = (use.input ?? {}) as Record<string, unknown>;
     const trace = tracer(use.name, raw);
@@ -244,7 +304,7 @@ export async function runQuick(input: AskInput): Promise<AskOutput> {
         const { url } = FetchInput.parse(raw);
         const seen = fetched.find((f) => f.url === url);
         const page = seen ?? (await fetchPage(url));
-        const src = seen ?? { n: fetched.length + 1, title: page.title, url, text: page.text };
+        const src = seen ?? { n: fetched.length + 1, kind: 'web' as const, title: page.title, url, text: page.text };
         if (!seen) fetched.push(src);
         trace(true);
         return {
@@ -252,6 +312,13 @@ export async function runQuick(input: AskInput): Promise<AskOutput> {
           tool_use_id: use.id,
           content: `Source [${src.n}]: ${src.title} (${src.url})\n\n${src.text.slice(0, RESEARCH_EXCERPT_CHARS)}`
         };
+      }
+
+      if (use.name === 'search_documents' && useDocs) {
+        const { query } = SearchInput.parse(raw);
+        const content = await docSearch(query);
+        trace(true);
+        return { type: 'tool_result', tool_use_id: use.id, content };
       }
 
       if (use.name === 'save_memory') {
@@ -296,10 +363,32 @@ export async function runQuick(input: AskInput): Promise<AskOutput> {
     }
   }
 
+  // ------------------------------------------------------------ router
+
+  // A Space with indexed documents is searched first, with the question itself, so a
+  // corpus question never depends on the model remembering to look.
+  let docsText = '';
+  if (useDocs && (input.mode === 'docs' || (await spaceHasIndexedDocs(input.userId, input.spaceId!)))) {
+    const raw = {
+      query: input.query,
+      reason:
+        input.mode === 'docs'
+          ? 'mode is docs: answer from this Space'
+          : "router: this Space has indexed documents, so check them before the web"
+    };
+    const trace = tracer('search_documents', raw);
+    try {
+      docsText = `Passages already retrieved from the user's documents:\n\n${await docSearch(input.query)}\n\n`;
+      trace(true);
+    } catch (err) {
+      trace(false, describeError(err));
+    }
+  }
+
   // ------------------------------------------------------------ phase 1: research
 
   const messages: Anthropic.MessageParam[] = [
-    { role: 'user', content: `${memoryText}${historyText}Question: ${input.query}` }
+    { role: 'user', content: `${memoryText}${historyText}${docsText}Question: ${input.query}` }
   ];
 
   for (;;) {
@@ -311,7 +400,7 @@ export async function runQuick(input: AskInput): Promise<AskOutput> {
     let resp: Anthropic.Message;
     try {
       resp = await anthropic.messages.create(
-        { ...baseParams, max_tokens: 4096, system: RESEARCH_SYSTEM, tools: TOOLS, messages },
+        { ...baseParams, max_tokens: 4096, system: RESEARCH_SYSTEM, tools, messages },
         { signal: AbortSignal.timeout(remainingMs) }
       );
     } catch (err) {
@@ -343,24 +432,29 @@ export async function runQuick(input: AskInput): Promise<AskOutput> {
     }
   }
 
-  if (searches.total > 0 && searches.failed === searches.total && fetched.length === 0) {
-    // Every search threw and nothing was read: that is an outage, never "no results".
-    throw new ProviderError(`search provider failed: ${searches.errors[0]}`);
+  const attempts = searches.total + docSearches.total;
+  if (attempts > 0 && searches.failed + docSearches.failed === attempts && fetched.length === 0) {
+    // Every retrieval threw and nothing was read: that is an outage, never "no results".
+    throw new ProviderError(`retrieval failed: ${[...searches.errors, ...docSearches.errors][0]}`);
   }
 
   // ------------------------------------------------------------ phase 2: answer
 
-  const sources: Source[] = fetched.map((f) => ({
-    n: f.n,
-    kind: 'web',
-    title: f.title,
-    url: f.url,
-    snippet: bestPassage(f.text, input.query) || f.text.slice(0, 300)
-  }));
+  const sources: Source[] = fetched.map((f) =>
+    f.kind === 'doc'
+      ? { n: f.n, kind: 'doc', title: f.title, docId: f.docId!, ...(f.locator ? { locator: f.locator } : {}), snippet: f.snippet! }
+      : { n: f.n, kind: 'web', title: f.title, url: f.url!, snippet: bestPassage(f.text, input.query) || f.text.slice(0, 300) }
+  );
   input.emit('sources', sources);
 
   const sourceBlock = fetched.length
-    ? fetched.map((f) => `[${f.n}] ${f.title} (${f.url})\n${f.text.slice(0, env.pageMaxChars)}`).join('\n\n---\n\n')
+    ? fetched
+        .map((f) =>
+          f.kind === 'doc'
+            ? `[${f.n}] ${f.title}, ${locatorLabel(f.locator)} (the user's document)\n${f.text}`
+            : `[${f.n}] ${f.title} (${f.url})\n${f.text.slice(0, env.pageMaxChars)}`
+        )
+        .join('\n\n---\n\n')
     : 'No sources were retrieved.';
   const savedNote = saved.length
     ? `\nThis turn you saved to the user's long-term memory: ${saved.map((t) => `"${t}"`).join('; ')}. Confirm that in one sentence.`

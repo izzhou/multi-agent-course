@@ -43,6 +43,7 @@ import { HealthResponse, ROUTES } from '@lumina/contract';
 import { env } from './env.js';
 import { pingDb } from './db.js';
 import { registerRoutes } from './routes.js';
+import { Worker } from 'node:worker_threads';
 
 const log = pino({ level: env.logLevel });
 const app = express();
@@ -94,6 +95,21 @@ app.use((err: Error, _req: express.Request, res: express.Response, _next: expres
   res.status(502).json({ error: err.message, status: 502 });
 });
 
+// The jobs worker runs on its own thread, so parsing and embedding never block an answer stream.
+if (env.workerInProcess) {
+  const dev = import.meta.url.endsWith('.ts');
+  const entry = new URL(dev ? './worker.ts' : './worker.js', import.meta.url).href;
+  // Under tsx (npm run dev) the thread has to register the TypeScript loader itself. The built dist/ is plain JS.
+  const worker = dev
+    ? new Worker(
+        `import('tsx/esm/api').then(({ register }) => { register(); return import(${JSON.stringify(entry)}); });`,
+        { eval: true }
+      )
+    : new Worker(new URL(entry));
+  worker.on('error', (err) => log.error({ err }, 'jobs worker crashed'));
+  worker.on('exit', (code) => log.error({ code }, 'jobs worker exited'));
+}
+
 app.listen(env.port, () => {
   log.info(
     {
@@ -106,6 +122,6 @@ app.listen(env.port, () => {
         deep: { toolCalls: env.maxToolCallsDeep, wallClockSec: env.maxWallClockSecDeep, dailyCap: env.deepDailyCap }
       }
     },
-    'agent up — every route but /health returns 501 until you build it'
+    'agent up'
   );
 });
