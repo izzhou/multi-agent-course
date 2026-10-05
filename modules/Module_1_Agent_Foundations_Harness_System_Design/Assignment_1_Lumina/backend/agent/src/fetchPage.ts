@@ -101,3 +101,15 @@ export function bestPassage(text: string, query: string): string {
   const words = best.split(' ');
   return words.length > 80 ? words.slice(0, 80).join(' ') : best;
 }
+
+/**
+ * Up to `maxChars` of `text`, centred on the passage that best matches `query`. A long page
+ * cut from the top often loses the one paragraph that answers the question, and deep search
+ * reads many pages, so each one gets a smaller window in the right place.
+ */
+export function excerptAround(text: string, query: string, maxChars: number): string {
+  if (text.length <= maxChars) return text;
+  const at = Math.max(0, text.indexOf(bestPassage(text, query)));
+  const start = Math.max(0, Math.min(at - Math.floor(maxChars / 3), text.length - maxChars));
+  return `${start > 0 ? '… ' : ''}${text.slice(start, start + maxChars)}${start + maxChars < text.length ? ' …' : ''}`;
+}

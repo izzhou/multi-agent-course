@@ -28,6 +28,8 @@ import { db } from './db.js';
 import { sseHeaders, sseSend } from './sse.js';
 import { newRunState, runCostUsd, runQuick } from './loop.js';
 import { ProviderError } from './llm.js';
+import { runDeep } from './deep.js';
+import { refundDeep, resetsAt, takeDeep } from './deepCap.js';
 import { deleteMemory, listMemories } from './memory.js';
 import { ownSpace, registerSpaceRoutes } from './spaces.js';
 
@@ -160,8 +162,6 @@ export function registerRoutes(app: express.Express, log: Logger): void {
     if (!parsed.success) return fail(res, 400, parsed.error.issues[0]?.message ?? 'invalid body', requestId);
     const ask = parsed.data;
 
-    // Not built yet, and saying so beats quietly answering a different question.
-    if (ask.depth === 'deep') return fail(res, 501, 'not implemented yet: depth "deep"', requestId);
     if (ask.mode === 'docs' && !ask.spaceId) return fail(res, 400, 'mode "docs" needs a spaceId', requestId);
 
     let streaming = false;
@@ -180,10 +180,24 @@ export function registerRoutes(app: express.Express, log: Logger): void {
         .insertOne({ ...runLog, requestId, userId, threadId: req.params.threadId, query: ask.query, createdAt: new Date(), ...extra });
     };
 
+    let spentDeep = false;
     try {
       const thread = await ownThread(req.params.threadId, userId);
       if (!thread) return fail(res, 404, `no thread ${req.params.threadId}`, requestId);
       if (ask.spaceId && !(await ownSpace(ask.spaceId, userId))) return fail(res, 404, `no space ${ask.spaceId}`, requestId);
+
+      // The cap is checked before anything is spent, and the 429 says when to come back.
+      if (ask.depth === 'deep') {
+        if (!(await takeDeep(userId))) {
+          return res.status(429).json({
+            error: `deep search limit reached: ${env.deepDailyCap} per day`,
+            status: 429,
+            requestId,
+            resetsAt: resetsAt()
+          });
+        }
+        spentDeep = true;
+      }
 
       const messages = (await db()).collection<MessageDoc>(COLLECTIONS.messages);
       const history = (
@@ -192,7 +206,8 @@ export function registerRoutes(app: express.Express, log: Logger): void {
         .reverse()
         .map((m) => ({ role: m.role, content: m.content }));
 
-      const result = await runQuick({
+      const run = ask.depth === 'deep' ? runDeep : runQuick;
+      const result = await run({
         userId,
         threadId: thread._id,
         query: ask.query,
@@ -223,6 +238,7 @@ export function registerRoutes(app: express.Express, log: Logger): void {
           answerId: result.done.answerId,
           sources: result.sources,
           done: result.done,
+          ...(result.plan ? { subQuestions: result.plan } : {}),
           createdAt: new Date(now)
         }
       ]);
@@ -263,7 +279,8 @@ export function registerRoutes(app: express.Express, log: Logger): void {
         depth: ask.depth,
         toolCalls: state.toolCalls
       };
-      log.error({ requestId, userId, err, terminated: 'error', toolCalls: state.toolCalls.length }, 'answer failed');
+      log.error({ requestId, userId, err, terminated: 'error', depth: ask.depth, toolCalls: state.toolCalls.length }, 'answer failed');
+      if (spentDeep) await refundDeep(userId).catch((e) => log.error({ requestId, err: e }, 'deep refund failed'));
       await writeRun(runLog, {}).catch((e) => log.error({ requestId, err: e }, 'run log write failed'));
       // Before the stream opened, the status line can still say 502. After, the error event does.
       if (!streaming) return fail(res, status, error, requestId);
