@@ -29,6 +29,7 @@ import { sseHeaders, sseSend } from './sse.js';
 import { newRunState, runCostUsd, runQuick } from './loop.js';
 import { ProviderError } from './llm.js';
 import { deleteMemory, listMemories } from './memory.js';
+import { ownSpace, registerSpaceRoutes } from './spaces.js';
 
 const HISTORY_MESSAGES = 6;
 
@@ -125,6 +126,8 @@ export function registerRoutes(app: express.Express, log: Logger): void {
     }
   });
 
+  registerSpaceRoutes(app);
+
   // ---------------------------------------------------------------- memory
 
   app.get('/memory', async (_req, res, next) => {
@@ -159,7 +162,7 @@ export function registerRoutes(app: express.Express, log: Logger): void {
 
     // Not built yet, and saying so beats quietly answering a different question.
     if (ask.depth === 'deep') return fail(res, 501, 'not implemented yet: depth "deep"', requestId);
-    if (ask.mode === 'docs') return fail(res, 501, 'not implemented yet: mode "docs"', requestId);
+    if (ask.mode === 'docs' && !ask.spaceId) return fail(res, 400, 'mode "docs" needs a spaceId', requestId);
 
     let streaming = false;
     const emit = (event: string, data: unknown) => {
@@ -180,6 +183,7 @@ export function registerRoutes(app: express.Express, log: Logger): void {
     try {
       const thread = await ownThread(req.params.threadId, userId);
       if (!thread) return fail(res, 404, `no thread ${req.params.threadId}`, requestId);
+      if (ask.spaceId && !(await ownSpace(ask.spaceId, userId))) return fail(res, 404, `no space ${ask.spaceId}`, requestId);
 
       const messages = (await db()).collection<MessageDoc>(COLLECTIONS.messages);
       const history = (
@@ -188,7 +192,16 @@ export function registerRoutes(app: express.Express, log: Logger): void {
         .reverse()
         .map((m) => ({ role: m.role, content: m.content }));
 
-      const result = await runQuick({ userId, threadId: thread._id, query: ask.query, history, emit, state });
+      const result = await runQuick({
+        userId,
+        threadId: thread._id,
+        query: ask.query,
+        mode: ask.mode,
+        ...(ask.spaceId ? { spaceId: ask.spaceId } : {}),
+        history,
+        emit,
+        state
+      });
 
       const now = Date.now();
       await messages.insertMany([
