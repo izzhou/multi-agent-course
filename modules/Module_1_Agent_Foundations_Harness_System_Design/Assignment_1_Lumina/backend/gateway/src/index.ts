@@ -22,6 +22,7 @@ import { randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { HealthResponse, REQUEST_HEADER, ROUTES, USER_HEADER } from '@lumina/contract';
 import { env } from './env.js';
+import { proxy } from './proxy.js';
 
 const log = pino({ level: env.logLevel });
 const app = express();
@@ -82,12 +83,11 @@ app.get('/health', async (_req, res) => {
   res.status(ai.status === 'ok' ? 200 : 503).json(body);
 });
 
-// ---------------------------------------------------------------- everything else: 501
+// ---------------------------------------------------------------- the contract routes
 
 /**
- * Every contract route answers 501 until you implement it. The UI renders that as
- * "not implemented yet", so the interface is your progress bar: each route you finish
- * lights up a piece of the product.
+ * Every contract route is forwarded to the agent service, which answers 501 for what it
+ * has not built yet. /evals/report.json stays 501 here until the eval skill writes one.
  */
 const notImplemented = (route: string) => (_req: express.Request, res: express.Response) => {
   res.status(501).json({
@@ -99,9 +99,9 @@ const notImplemented = (route: string) => (_req: express.Request, res: express.R
 
 for (const route of ROUTES) {
   if (route.path === '/health') continue;
-  const path = route.path.replace(/:(\w+)/g, ':$1');
   const method = route.method.toLowerCase() as 'get' | 'post' | 'delete';
-  app[method](path, notImplemented(`${route.method} ${route.path}`));
+  const key = `${route.method} ${route.path}`;
+  app[method](route.path, route.path === '/evals/report.json' ? notImplemented(key) : proxy(key));
 }
 
 // ---------------------------------------------------------------- static UI
