@@ -23,6 +23,7 @@ import {
   type Locator,
   type RunLog,
   type Source,
+  type SubQuestion,
   type Terminated,
   type TraceEvent
 } from '@lumina/contract';
@@ -34,7 +35,7 @@ import { embeddingCostUsd } from './embeddings.js';
 import { recallMemories, saveMemory } from './memory.js';
 import { searchDocuments, spaceHasIndexedDocs } from './rag.js';
 
-export type Emit = (event: 'trace' | 'sources' | 'token', data: unknown) => void;
+export type Emit = (event: 'plan' | 'trace' | 'sources' | 'token', data: unknown) => void;
 
 /** Filled in as the run goes, so a run that throws can still be logged honestly. */
 export interface RunState {
@@ -70,10 +71,12 @@ export interface AskOutput {
   sources: Source[];
   done: DoneEvent;
   runLog: RunLog;
+  /** Deep search only: the plan it ran, stored with the answer. */
+  plan?: SubQuestion[];
 }
 
 /** Something retrieved in this request: a fetched page or a document chunk. The only things an [n] may point at. */
-interface Citable {
+export interface Citable {
   n: number;
   kind: 'web' | 'doc';
   title: string;
@@ -86,7 +89,7 @@ interface Citable {
   snippet?: string;
 }
 
-const locatorLabel = (l?: Locator) =>
+export const locatorLabel = (l?: Locator) =>
   l?.page ? `p. ${l.page}` : l?.heading ? `"${l.heading}"` : l?.line ? `line ${l.line}` : '';
 
 const RESEARCH_EXCERPT_CHARS = 2500;
@@ -170,7 +173,7 @@ Rules:
 - Lead with the direct answer. Be concise: a short paragraph or a few bullets, no preamble.
 - Follow the user's saved preferences when they are given. They change how you answer, never what the sources say.`;
 
-const describeError = (err: unknown) => (err instanceof Error ? err.message : String(err)) || 'unknown error';
+export const describeError = (err: unknown) => (err instanceof Error ? err.message : String(err)) || 'unknown error';
 
 /**
  * Drops any [n] that does not name a source of this request, even across token
